@@ -1,0 +1,143 @@
+name: Build and deploy (reusable)
+
+# The one build-and-deploy pipeline for every app on sun. Callers are one job
+# block in the app's own repo; everything below is shared, so a fix here lands
+# in all of them at once.
+#
+# What a caller still owns, because it cannot be shared:
+#   - its own self-hosted runner, registered to that repo (GitHub has no
+#     org-level runners on a personal account), labelled `sun`
+#   - its own ZOT_USERNAME / ZOT_PASSWORD / GITOPS_DEPLOY_KEY secrets, passed
+#     down with `secrets: inherit`
+#   - its own Dockerfile, including the BuildKit cache mounts that keep builds
+#     incremental -- a cache mount is a flag on a RUN line and no amount of
+#     shared workflow can supply it
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: >-
+          Zot repository name. Also names the sun-gitops directory the image tag
+          is written into (apps/<image>/values.yaml).
+        required: true
+        type: string
+      values_file:
+        description: >-
+          Path in sun-gitops whose `image:` line receives the new tag. Defaults
+          to apps/<image>/values.yaml. Pass apps/<image>/dev.yaml to deploy a
+          branch into a dev environment.
+        required: false
+        type: string
+        default: ''
+      runner_label:
+        description: Second label of the self-hosted runner to build on.
+        required: false
+        type: string
+        default: sun
+    secrets:
+      ZOT_USERNAME:
+        required: true
+      ZOT_PASSWORD:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        description: Private half of a deploy key with WRITE access to sun-gitops.
+        required: true
+
+env:
+  # Where CI pushes to: Zot's NodePort on barnet. The runner is outside the
+  # cluster but on the same subnet as the node, so this is a direct hop --
+  # no tailnet round-trip, no ACL grant. Plain HTTP on a private lab network;
+  # Zot still enforces htpasswd auth.
+  PUSH_REGISTRY: 10.90.0.10:30500
+  # What the deployment manifest references: the cluster-internal name, which the
+  # k3s node resolves to Zot's ClusterIP via /etc/rancher/k3s/registries.yaml.
+  IMAGE_REGISTRY: zot.registry.svc.cluster.local:5000
+  IMAGE: ${{ inputs.image }}
+
+jobs:
+  build:
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Derive image tags
+        id: meta
+        run: |
+          SHA_TAG="${GITHUB_SHA::7}"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          TAGS="${SHA_TAG}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAGS="${TAGS} ${GITHUB_REF_NAME#v}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Building tags: ${TAGS}"
+
+      - name: Build image
+        run: DOCKER_BUILDKIT=1 docker build -t "${IMAGE}:${{ steps.meta.outputs.sha_tag }}" .
+
+      # Zot is strict OCI-only and rejects Docker V2 manifests with HTTP 415,
+      # so push via skopeo with --format oci rather than `docker push`.
+      # Uses docker-archive rather than the docker-daemon transport: Debian's
+      # skopeo speaks an API version too old for current Docker daemons.
+      - name: Push to Zot
+        env:
+          ZOT_USER: ${{ secrets.ZOT_USERNAME }}
+          ZOT_PASS: ${{ secrets.ZOT_PASSWORD }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+        run: |
+          ARCHIVE="$(mktemp -d)/image.tar"
+          trap 'rm -rf "$(dirname "$ARCHIVE")"' EXIT
+          docker save "${IMAGE}:${SHA_TAG}" -o "$ARCHIVE"
+
+          for tag in ${{ steps.meta.outputs.tags }}; do
+            echo "Pushing ${PUSH_REGISTRY}/${IMAGE}:${tag}"
+            skopeo copy --format oci \
+              "docker-archive:${ARCHIVE}" \
+              "docker://${PUSH_REGISTRY}/${IMAGE}:${tag}" \
+              --dest-creds "${ZOT_USER}:${ZOT_PASS}" \
+              --dest-tls-verify=false
+          done
+
+      - name: Update image tag in sun-gitops
+        env:
+          GITOPS_SSH_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          NEW_TAG: ${{ steps.meta.outputs.sha_tag }}
+          VALUES_FILE: ${{ inputs.values_file }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$GITOPS_SSH_KEY" > ~/.ssh/gitops_key
+          chmod 600 ~/.ssh/gitops_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/gitops_key -o IdentitiesOnly=yes"
+
+          rm -rf /tmp/sun-gitops
+          git clone git@github.com:vongaisberg/sun-gitops.git /tmp/sun-gitops
+          cd /tmp/sun-gitops
+
+          # Apps are rendered from the shared chart in charts/app, so the image
+          # lives in the app's values file, not in a deployment.yaml.
+          DEPLOY_FILE="${VALUES_FILE:-apps/${IMAGE}/values.yaml}"
+          echo "Updating ${DEPLOY_FILE}"
+          sed -i -E "s|(image: ${IMAGE_REGISTRY}/${IMAGE}):.*|\1:${NEW_TAG}|" "$DEPLOY_FILE"
+
+          # Fail loudly rather than committing nothing if the line ever moves.
+          if ! grep -q "image: ${IMAGE_REGISTRY}/${IMAGE}:${NEW_TAG}" "$DEPLOY_FILE"; then
+            echo "::error::image line not found in ${DEPLOY_FILE}" >&2
+            exit 1
+          fi
+
+          if git diff --quiet; then
+            echo "Image tag already ${NEW_TAG}, nothing to commit."
+            rm -f ~/.ssh/gitops_key
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$DEPLOY_FILE"
+          git commit -m "${IMAGE}: deploy ${NEW_TAG} to ${GITHUB_REF_NAME}" \
+            -m "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          git push origin main
+
+          rm -f ~/.ssh/gitops_key
