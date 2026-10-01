@@ -106,8 +106,10 @@ jobs:
           VALUES_FILE: ${{ inputs.values_file }}
         run: |
           mkdir -p ~/.ssh
-          echo "$GITOPS_SSH_KEY" > ~/.ssh/gitops_key
-          chmod 600 ~/.ssh/gitops_key
+          # The runner is self-hosted and persistent: remove the key however
+          # this step ends, not only on the paths that reach the end.
+          trap 'rm -f ~/.ssh/gitops_key' EXIT
+          (umask 077 && echo "$GITOPS_SSH_KEY" > ~/.ssh/gitops_key)
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/gitops_key -o IdentitiesOnly=yes"
 
@@ -129,7 +131,6 @@ jobs:
 
           if git diff --quiet; then
             echo "Image tag already ${NEW_TAG}, nothing to commit."
-            rm -f ~/.ssh/gitops_key
             exit 0
           fi
 
@@ -138,6 +139,13 @@ jobs:
           git add "$DEPLOY_FILE"
           git commit -m "${IMAGE}: deploy ${NEW_TAG} to ${GITHUB_REF_NAME}" \
             -m "Built from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
-          git push origin main
-
-          rm -f ~/.ssh/gitops_key
+          # Builds of other apps, or of this app's other branch, push to the
+          # same main. If one got there first, replay this commit on top of it.
+          for attempt in 1 2 3 4 5; do
+            git push origin main && exit 0
+            echo "Push rejected (attempt ${attempt}), rebasing onto origin/main"
+            sleep $((attempt * 2))
+            git pull --rebase origin main
+          done
+          echo "::error::could not push to sun-gitops after 5 attempts" >&2
+          exit 1
